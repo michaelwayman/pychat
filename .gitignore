@@ -1,0 +1,11 @@
+# Python & Env stuff
+.idea
+.venv
+.mypy_cache
+*.pyc
+
+# SSL stuff
+*.crt
+*.key
+*.pem
+*.srl
