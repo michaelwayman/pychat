@@ -5,6 +5,7 @@ import asyncio
 import curses
 import curses.ascii
 import curses.panel
+import dataclasses
 import enum
 import json
 import ssl
@@ -12,7 +13,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
@@ -28,12 +29,35 @@ def debug():
     pdb.set_trace()
 
 
+class JsonEncoder(json.JSONEncoder):
+
+    def default(self, value):
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        return super().default(value)
+
+
+class JsonDecoder(json.JSONDecoder):
+    def __init__(self, **kwargs):
+        super().__init__(object_hook=self.object_hook, **kwargs)
+
+    def object_hook(self, d: dict):
+        for k, v in d.items():
+            if isinstance(v, str):
+                try:
+                    d[k] = uuid.UUID(v)
+                except ValueError:
+                    pass
+        return d
+
+
 @dataclass
 class RunConfig:
     """Class to house the runtime configuration options."""
 
     host: str
     port: str
+    username: str
     serve: bool
     ssl: bool
     certfile: str
@@ -41,11 +65,60 @@ class RunConfig:
 
 
 class DataType(enum.IntEnum):
-    MSG = enum.auto()
-    SYS_MSG = enum.auto()
+    JSON = enum.auto()
+
+
+@dataclass
+class User:
+    uid: uuid.UUID
+    username: str
+
+
+@dataclass
+class ServerInfo:
+    users: list[User]
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+
+@dataclass
+class ChatMessage:
+    uid: uuid.UUID
+    username: str
+    text: str
+
+
+@dataclass
+class SystemMessage:
+    text: str
 
 
 class Events:
+
+    def __init__(self):
+        self.subscribers = defaultdict(list)
+
+    def subscribe(self, fn, *event_types):
+        for event_type in event_types:
+            self.subscribers[event_type].append(fn)
+
+    def register(self, *event_types):
+        def wrapper(fn):
+            for event in event_types:
+                self.subscribers[event].append(fn)
+            return fn
+        return wrapper
+
+    async def push(self, event):
+        for subscriber in self.subscribers[event.__class__]:
+            if asyncio.iscoroutinefunction(subscriber):
+                asyncio.Task(subscriber(event))
+            else:
+                subscriber(event)
+
     class ServerStarted:
         ...
 
@@ -54,10 +127,12 @@ class Events:
 
     @dataclass
     class NewConnection:
+        cid: uuid.UUID
         remote_address: str
 
     @dataclass
     class LostConnection:
+        cid: uuid.UUID
         remote_address: str
 
     @dataclass
@@ -69,61 +144,35 @@ class Events:
         def data_type(self):
             return DataType.from_bytes(self.data[:1], byteorder="big")
 
+        def json(self):
+            as_str = self.data[1:].decode()
+            as_dict = json.loads(as_str, cls=JsonDecoder)
+            return as_dict
+
     @dataclass
     class OutgoingData:
         type: DataType
         data: bytes
-        exclude_ids: set[uuid.UUID]
+        exclude: set[uuid.UUID] | None = None
+        include: set[uuid.UUID] | None = None
 
         def to_bytes(self):
             return self.type.to_bytes(length=1, byteorder="big") + self.data
+
+        @classmethod
+        def from_dataclass(cls, dc, exclude=None, include=None):
+            as_dict = dataclasses.asdict(dc)
+            as_dict["type"] = dc.__class__.__name__
+            as_str = json.dumps(as_dict, cls=JsonEncoder)
+            as_bytes = as_str.encode()
+            return cls(type=DataType.JSON, data=as_bytes, exclude=exclude, include=include)
 
     @dataclass
     class UserInputSubmitted:
         text: str
 
-    @dataclass
-    class Message:
-        uid: uuid.UUID
-        text: str
 
-        def to_bytes(self):
-            return self.uid.bytes + self.text.encode()
-
-        @classmethod
-        def from_bytes(cls, b: bytes):
-            return cls(uid=uuid.UUID(bytes=b[:16]), text=b[16:].decode())
-
-    # @dataclass
-    # class JsonMessage:
-    #     json: dict
-    #
-    #     @classmethod
-    #     def from_bytes(cls, b: bytes):
-    #         return cls(json=json.loads(b.decode()))
-    #
-    #     def to_bytes(self) -> bytes:
-    #         return json.dumps(self.json).encode()
-
-
-class EventPubSub:
-    def __init__(self):
-        self.lock = asyncio.Lock()
-        self.subscribers = defaultdict(list)
-
-    def subscribe(self, fn, *event_types):
-        for event_type in event_types:
-            self.subscribers[event_type].append(fn)
-
-    async def publish(self, event):
-        for subscriber in self.subscribers[event.__class__]:
-            if asyncio.iscoroutinefunction(subscriber):
-                asyncio.Task(subscriber(event))
-            else:
-                subscriber(event)
-
-
-events = EventPubSub()
+events = Events()
 
 
 class NetworkConnection:
@@ -142,6 +191,7 @@ class NetworkConnection:
         self.writer = writer
         self.write_queue = asyncio.Queue[bytes]()
         self.remote_address = writer.get_extra_info("peername", default=["Unknown"])[0]
+        self.username = None
 
     def __hash__(self):
         return hash(self.cid)
@@ -157,7 +207,7 @@ class NetworkConnection:
             data_size = await self.reader.readexactly(4)
             if data_size:
                 data = await self.reader.readexactly(int.from_bytes(data_size, byteorder="big"))
-                await events.publish(Events.IncomingData(cid=self.cid, data=data))
+                await events.push(Events.IncomingData(cid=self.cid, data=data))
             else:
                 raise ConnectionResetError
 
@@ -216,7 +266,7 @@ class Network:
             ssl=self.create_ssl_context(),
         )
         async with server:
-            await events.publish(Events.ServerStarted())
+            await events.push(Events.ServerStarted())
             await server.serve_forever()
 
     async def start_client(self):
@@ -224,7 +274,7 @@ class Network:
         reader, writer = await asyncio.open_connection(
             host=config.host, port=config.port, ssl=self.create_ssl_context()
         )
-        await events.publish(Events.ConnectedToHost())
+        await events.push(Events.ConnectedToHost())
         await self.new_connection(reader=reader, writer=writer)
 
     async def start(self):
@@ -249,18 +299,21 @@ class Network:
     async def add_connection(self, c: NetworkConnection):
         async with self.connection_lock:
             self.connections.add(c)
-            await events.publish(Events.NewConnection(remote_address=c.remote_address))
+            await events.push(Events.NewConnection(remote_address=c.remote_address, cid=c.cid))
 
     async def remove_connection(self, c: NetworkConnection):
         async with self.connection_lock:
             self.connections.remove(c)
-            await events.publish(Events.LostConnection(remote_address=c.remote_address))
+            await events.push(Events.LostConnection(remote_address=c.remote_address, cid=c.cid))
 
-    async def send(self, data: bytes, exclude_ids=()):
+    async def send(self, data: bytes, exclude=None, include=None):
         async with self.connection_lock:
             for connection in self.connections:
-                if connection.cid not in exclude_ids:
-                    await connection.send(data)
+                if include and connection.cid not in include:
+                    continue
+                if exclude and connection.cid in exclude:
+                    continue
+                await connection.send(data)
 
 
 class BaseUIWidget:
@@ -497,7 +550,17 @@ class AppUI:
                 await self.focused_widget.handle_ch(ch)  # pass the key-press to whichever widget has focus
 
     async def handle_input_submitted(self, text: str):
-        await events.publish(Events.UserInputSubmitted(text=text))
+        await events.push(Events.UserInputSubmitted(text=text))
+
+
+async def send_dataclass(dc, exclude=None, include=None) -> None:
+    data = Events.OutgoingData.from_dataclass(dc, exclude=exclude, include=include)
+    await events.push(data)
+
+
+async def system_message(text: str):
+    msg = SystemMessage(text=text)
+    await events.push(msg)
 
 
 async def main_app(stdscr):
@@ -507,54 +570,57 @@ async def main_app(stdscr):
     network = Network()
     user_uid = uuid.uuid4()
 
+    server_info = ServerInfo(users=[User(uid=user_uid, username=config.username)])
+
+    @events.register(Events.UserInputSubmitted)
     async def on_input_submitted(event: Events.UserInputSubmitted):
-        msg = Events.Message(uid=user_uid, text=event.text)
-        await events.publish(msg)
+        msg = ChatMessage(uid=user_uid, username=config.username, text=event.text)
+        await events.push(msg)
 
-    async def on_connection_events(event):
-        if isinstance(event, Events.ServerStarted):
-            text = f"Server started on {config.host}:{config.port}"
-        elif isinstance(event, Events.ConnectedToHost):
-            text = f"Connected to server {config.host}:{config.port}"
-        elif isinstance(event, Events.NewConnection):
-            text = f"New connection: remote_address {event.remote_address}"
-        elif isinstance(event, Events.LostConnection):
-            text = f"Connection ended: remote_address {event.remote_address}"
-        else:
-            raise TypeError
-        msg = Events.Message(uid=app_uid, text=text)
-        await events.publish(msg)
+    @events.register(Events.ServerStarted)
+    async def on_server_started(event: Events.ServerStarted):
+        await system_message(f"Server started on {config.host}:{config.port}")
 
-    async def on_message(event: Events.Message):
+    @events.register(Events.ConnectedToHost)
+    async def on_connected_to_host(event: Events.ConnectedToHost):
+        await system_message(f"Connected to server {config.host}:{config.port}")
+
+    @events.register(Events.OutgoingData)
+    async def on_outgoing_data(event: Events.OutgoingData):
+        await network.send(event.to_bytes(), exclude=event.exclude, include=event.include)
+
+    @events.register(Events.IncomingData)
+    async def on_incoming_data(event: Events.IncomingData):
+        if event.data_type == DataType.JSON:
+            json_data = event.json()
+            type = json_data.pop("type")
+            if type == "ServerInfo":
+                server_info.update(**json_data)
+            elif type == "ChatMessage":
+                msg = ChatMessage(**json_data)
+                if config.serve:
+                    msg.uid = event.cid
+                await events.push(msg)
+
+    @events.register(ChatMessage)
+    async def on_chat_message(event: ChatMessage):
         ui.chat_messages_widget.add_msg(text=event.text, uid=event.uid)
         if config.serve or event.uid == user_uid:
-            dt = DataType.SYS_MSG if event.uid == app_uid else DataType.MSG
-            await events.publish(Events.OutgoingData(type=dt, data=event.to_bytes(), exclude_ids={event.uid}))
+            await send_dataclass(event, exclude={event.uid})
 
-    async def on_outgoing_data(event: Events.OutgoingData):
-        await network.send(event.to_bytes(), exclude_ids=event.exclude_ids)
+    @events.register(SystemMessage)
+    async def on_system_message(event: SystemMessage):
+        ui.chat_messages_widget.add_msg(text=event.text, uid=app_uid)
 
-    async def on_incoming_data(event: Events.IncomingData):
-        if event.data_type in (DataType.MSG, DataType.SYS_MSG):
-            msg = Events.Message.from_bytes(event.data[1:])
-            if config.serve:
-                msg.uid = event.cid  # Force a user's id to be the same as the connection id if we are the server
-            elif event.data_type == DataType.SYS_MSG:
-                msg.uid = app_uid
-            await events.publish(msg)
+    @events.register(Events.LostConnection)
+    async def on_lost_connection(event: Events.LostConnection):
+        await system_message(f"Connection ended: remote_address {event.remote_address}")
 
-    events.subscribe(on_input_submitted, Events.UserInputSubmitted)
-    events.subscribe(on_outgoing_data, Events.OutgoingData)
-    events.subscribe(on_incoming_data, Events.IncomingData)
-    events.subscribe(on_message, Events.Message)
-    events.subscribe(
-        on_connection_events,
-        Events.ServerStarted,
-        Events.ConnectedToHost,
-        Events.LostConnection,
-    )
     if config.serve:
-        events.subscribe(on_connection_events, Events.NewConnection)
+        @events.register(Events.NewConnection)
+        async def on_new_connection(event: Events.NewConnection):
+            await system_message(f"New connection: remote_address {event.remote_address}")
+            await send_dataclass(server_info, include={event.cid})
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(ui.start())
@@ -574,6 +640,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyChat :)")
     parser.add_argument("-H", "--host", action="store", help="Host of sever", default="0.0.0.0")
     parser.add_argument("-P", "--port", action="store", help="Port of sever", default="8080")
+    parser.add_argument("-u", "--username", action="store", help="Display name to use in the chat", default="Anonymous")
     parser.add_argument("-s", "--serve", action="store_true", help="Run the chat server for others to connect")
     parser.add_argument("--ssl", action="store_true", help="Use secure connection via SSL")
     parser.add_argument("--certfile", action="store", help="Path to SSL certificate", default="./client.pem")
