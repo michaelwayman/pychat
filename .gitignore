@@ -3,6 +3,7 @@
 .venv
 .mypy_cache
 *.pyc
+.DS_Store
 
 # SSL stuff
 *.crt

@@ -6,12 +6,13 @@ import curses
 import curses.ascii
 import curses.panel
 import enum
+import json
 import ssl
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
@@ -29,96 +30,147 @@ def debug():
 
 @dataclass
 class RunConfig:
-    """Class to house the run-time configuration options."""
+    """Class to house the runtime configuration options."""
+
     host: str
     port: str
     serve: bool
     ssl: bool
     certfile: str
     cafile: str
-    debug: bool
 
 
-class MsgType(enum.IntEnum):
-    MSG = 0
-    INFO = 1
+class DataType(enum.IntEnum):
+    MSG = enum.auto()
+    SYS_MSG = enum.auto()
 
 
-@dataclass
-class ChatMsg:
-    type: MsgType
-    uid: uuid.UUID
-    data: str
+class Events:
+    class ServerStarted:
+        ...
 
-    def to_bytes(self):
-        return self.type.to_bytes() + self.uid.bytes + self.data.encode()
+    class ConnectedToHost:
+        ...
 
-    @classmethod
-    def from_bytes(cls, b: bytes, uid_override=None):
-        type = b[:1]
-        if uid_override is None:
-            uid_override = uuid.UUID(bytes=b[1:17])
-        data = b[17:].decode()
-        return cls(type=MsgType.from_bytes(type), uid=uid_override, data=data)
+    @dataclass
+    class NewConnection:
+        remote_address: str
+
+    @dataclass
+    class LostConnection:
+        remote_address: str
+
+    @dataclass
+    class IncomingData:
+        cid: uuid.UUID
+        data: bytes
+
+        @cached_property
+        def data_type(self):
+            return DataType.from_bytes(self.data[:1], byteorder="big")
+
+    @dataclass
+    class OutgoingData:
+        type: DataType
+        data: bytes
+        exclude_ids: set[uuid.UUID]
+
+        def to_bytes(self):
+            return self.type.to_bytes(length=1, byteorder="big") + self.data
+
+    @dataclass
+    class UserInputSubmitted:
+        text: str
+
+    @dataclass
+    class Message:
+        uid: uuid.UUID
+        text: str
+
+        def to_bytes(self):
+            return self.uid.bytes + self.text.encode()
+
+        @classmethod
+        def from_bytes(cls, b: bytes):
+            return cls(uid=uuid.UUID(bytes=b[:16]), text=b[16:].decode())
+
+    # @dataclass
+    # class JsonMessage:
+    #     json: dict
+    #
+    #     @classmethod
+    #     def from_bytes(cls, b: bytes):
+    #         return cls(json=json.loads(b.decode()))
+    #
+    #     def to_bytes(self) -> bytes:
+    #         return json.dumps(self.json).encode()
 
 
-class MessageManager:
+class EventPubSub:
     def __init__(self):
-        self.messages = asyncio.Queue[ChatMsg]()
+        self.lock = asyncio.Lock()
+        self.subscribers = defaultdict(list)
 
-    async def new_system_message(self, msg: str):
-        await self.messages.put(ChatMsg(uid=app_uid, type=MsgType.MSG, data=msg))
+    def subscribe(self, fn, *event_types):
+        for event_type in event_types:
+            self.subscribers[event_type].append(fn)
 
-    async def new_user_message(self, msg: str):
-        cm = ChatMsg(uid=user_uid, type=MsgType.MSG, data=msg)
-        await self.messages.put(cm)
-        await connections.send_msg(cm.to_bytes())
-
-    async def new_inbound_message(self, data: bytes, uid_override: uuid.UUID | None):
-        cm = ChatMsg.from_bytes(b=data, uid_override=uid_override)
-        if cm.type == MsgType.MSG:
-            await self.messages.put(cm)
-            if config.serve:
-                await connections.send_msg(data, exclude_ids={cm.uid})
-
-    def get_message(self) -> ChatMsg | None:
-        try:
-            return self.messages.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
+    async def publish(self, event):
+        for subscriber in self.subscribers[event.__class__]:
+            if asyncio.iscoroutinefunction(subscriber):
+                asyncio.Task(subscriber(event))
+            else:
+                subscriber(event)
 
 
-class Connection:
+events = EventPubSub()
+
+
+class NetworkConnection:
+    """
+    Connection represents a single connection between a server/client.
+
+    Each connection gets its own
+     - `StreamReader` & `StreamWriter` - to read and write to the connected socket
+     - `UUID` to uniquely identify the connection
+     - `Queue` for messages that need sent across the wire
+    """
+
     def __init__(self, reader: "StreamReader", writer: "StreamWriter"):
-        self.id = uuid.uuid4()
+        self.cid = uuid.uuid4()
         self.reader = reader
         self.writer = writer
         self.write_queue = asyncio.Queue[bytes]()
-        self.forced_uid = self.id if config.serve else None
         self.remote_address = writer.get_extra_info("peername", default=["Unknown"])[0]
 
     def __hash__(self):
-        return hash(self.id)
+        return hash(self.cid)
 
     async def close(self):
+        """Closes the connection."""
         self.writer.close()
         await self.writer.wait_closed()
 
     async def read_loop(self):
+        """Creates an infinite loop to read from the buffer and pushed incoming data to the global MessageManager."""
         while True:
-            data = await self.reader.read(1024)
-            if data:
-                await messages.new_inbound_message(data=data, uid_override=self.forced_uid)
+            data_size = await self.reader.readexactly(4)
+            if data_size:
+                data = await self.reader.readexactly(int.from_bytes(data_size, byteorder="big"))
+                await events.publish(Events.IncomingData(cid=self.cid, data=data))
             else:
                 raise ConnectionResetError
 
     async def write_loop(self):
+        """Creates an infinite loop to check for data in the Queue and sends it across the wire."""
         while True:
             data = await self.write_queue.get()
+            self.writer.write(len(data).to_bytes(length=4, byteorder="big"))
             self.writer.write(data)
             await self.writer.drain()
 
-    async def serve_forever(self):
+    async def keep_alive(self):
+        """Runs both of the infinite read & write loops."""
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self.read_loop())
@@ -130,39 +182,88 @@ class Connection:
         await self.write_queue.put(data)
 
 
-class ConnectionManager:
+class Network:
     def __init__(self) -> None:
-        self.connections: set[Connection] = set()
-        self._lock = asyncio.Lock()  # lock to access connections
+        self.connections: set[NetworkConnection] = set()
+        self.connection_lock = asyncio.Lock()  # lock to access connections
+
+    @classmethod
+    def create_ssl_context(cls) -> ssl.SSLContext | None:
+        """Returns an SSL context to use based on the global RunConfig or None."""
+        if not config.ssl:
+            return None
+
+        if config.serve:
+            protocol = ssl.PROTOCOL_TLS_SERVER
+            default_certs = ssl.Purpose.CLIENT_AUTH
+        else:
+            protocol = ssl.PROTOCOL_TLS_CLIENT
+            default_certs = ssl.Purpose.SERVER_AUTH
+
+        c = ssl.SSLContext(protocol)
+        c.load_cert_chain(certfile=config.certfile)
+        c.load_verify_locations(cafile=config.cafile)
+        c.load_default_certs(default_certs)
+        c.verify_mode = ssl.CERT_REQUIRED
+        return c
+
+    async def start_server(self):
+        """Starts & runs the server indefinitely adding each new client to `connections`."""
+        server = await asyncio.start_server(
+            client_connected_cb=self.new_connection,
+            host=config.host,
+            port=config.port,
+            ssl=self.create_ssl_context(),
+        )
+        async with server:
+            await events.publish(Events.ServerStarted())
+            await server.serve_forever()
+
+    async def start_client(self):
+        """Starts & runs the client indefinitely and adds the connection to the server to `connections`."""
+        reader, writer = await asyncio.open_connection(
+            host=config.host, port=config.port, ssl=self.create_ssl_context()
+        )
+        await events.publish(Events.ConnectedToHost())
+        await self.new_connection(reader=reader, writer=writer)
+
+    async def start(self):
+        """Starts & runs the client or server indefinitely."""
+        if config.serve:
+            await self.start_server()
+        else:
+            await self.start_client()
 
     async def new_connection(self, reader: "StreamReader", writer: "StreamWriter"):
-        c = Connection(reader=reader, writer=writer)
-        await self.add(c)
+        connection = NetworkConnection(reader=reader, writer=writer)
+        await self.add_connection(connection)
         try:
-            await c.serve_forever()
+            await connection.keep_alive()
         except* ConnectionResetError:
             pass
+        except* asyncio.IncompleteReadError:
+            pass
         finally:
-            await self.remove(c)
+            await self.remove_connection(connection)
 
-    async def add(self, c: Connection):
-        async with self._lock:
+    async def add_connection(self, c: NetworkConnection):
+        async with self.connection_lock:
             self.connections.add(c)
-            await messages.new_system_message(f"New connection: remote_address {c.remote_address}")
+            await events.publish(Events.NewConnection(remote_address=c.remote_address))
 
-    async def remove(self, c: Connection):
-        async with self._lock:
+    async def remove_connection(self, c: NetworkConnection):
+        async with self.connection_lock:
             self.connections.remove(c)
-            await messages.new_system_message(f"Connection ended: remote_address {c.remote_address}")
+            await events.publish(Events.LostConnection(remote_address=c.remote_address))
 
-    async def send_msg(self, data: bytes, exclude_ids=()):
-        async with self._lock:
+    async def send(self, data: bytes, exclude_ids=()):
+        async with self.connection_lock:
             for connection in self.connections:
-                if connection.id not in exclude_ids:
+                if connection.cid not in exclude_ids:
                     await connection.send(data)
 
 
-class BaseWindow:
+class BaseUIWidget:
     def __init__(self, w, n_lines=128):
         self.background = w
         self.height, self.width = w.getmaxyx()
@@ -229,7 +330,7 @@ class BaseWindow:
         self.focus = focus
 
 
-class ChatWindow(BaseWindow):
+class ScrollableTextUIWidget(BaseUIWidget):
     def __init__(self, stdscr, lines=128):
         super().__init__(stdscr, lines)
         # Init curses color pairs
@@ -258,10 +359,9 @@ class ChatWindow(BaseWindow):
             self.color_map[uid] = next(self.next_color)
         return self.color_map[uid]
 
-    def add_msg(self, cm: ChatMsg):
+    def add_msg(self, text: str, uid: uuid.UUID):
         """Adds a new message to show for the user."""
-        msg = cm.data.strip()
-
+        msg = text.strip()
         # Purge earlier messages if we've reached the max history length
         n_lines = msg.count("\n")
         y, _ = self.pad.getyx()
@@ -269,7 +369,7 @@ class ChatWindow(BaseWindow):
             self.purge_earliest(n_lines)
 
         # Show the message by adding it to the pad
-        self.pad.addstr(" > " + msg + "\n", self.get_user_color(cm.uid))
+        self.pad.addstr(" > " + msg + "\n", self.get_user_color(uid))
 
         # If the window doesn't currently have focus then go ahead and scroll the window
         # to make the latest message visible
@@ -279,17 +379,26 @@ class ChatWindow(BaseWindow):
         self.refresh()
 
 
-class InputWindow(BaseWindow):
-    def __init__(self, window, n_lines=128):
+class InputUIWidget(BaseUIWidget):
+    def __init__(self, window, input_submitted_cb, n_lines=128, clear_on_submit=True):
         super().__init__(window, n_lines)
+        self.input_submitted_cb = input_submitted_cb
+        self.clear_on_submit = clear_on_submit
 
-    async def on_input_submit(self):
-        """Callback for when the user presses enter, passes the text to the global MessageManager."""
-        text = self.get_pad_text()
-        text = text.strip()
-        await messages.new_user_message(text)
+    async def handle_ch__return(self):
+        """Treats the return/enter key-press as if the user were submitting their input.
+        It calls the `input_submitted_cb` and empties the widget text and resets scrolling etc."""
+        text = self.get_text().strip()
+        if asyncio.iscoroutinefunction(self.input_submitted_cb):
+            await self.input_submitted_cb(text)
+        else:
+            self.input_submitted_cb(text)
 
-    def get_pad_text(self) -> str:
+        if self.clear_on_submit:
+            self.pad.erase()
+            self.pad.move(0, 0)
+
+    def get_text(self) -> str:
         """Returns all the text in the pad."""
         all_lines = []
         for y in range(0, self.n_lines):
@@ -300,7 +409,7 @@ class InputWindow(BaseWindow):
         return "\n".join(all_lines)
 
     async def handle_ch(self, ch: int) -> bool:
-        """Handle a key-press of `ch` and return whether the key was handled."""
+        """Handles a key-press of `ch` and returns whether the key was handled."""
         y, x = self.pad.getyx()
         if curses.ascii.isprint(ch):
             self.pad.addch(ch)
@@ -324,17 +433,13 @@ class InputWindow(BaseWindow):
             if x > 0:
                 self.pad.move(y, x - 1)
             elif y == 0:
-                return True
+                pass
             self.pad.delch()
         elif ch == curses.KEY_DC:  # delete
             self.pad.delch()
-        elif ch == curses.ascii.NL:  # return
-            await self.on_input_submit()
-            self.pad.erase()
-            self.pad.move(0, 0)
+        elif ch == curses.ascii.NL:  # return / enter
+            await self.handle_ch__return()
         else:
-            if config.debug:
-                await messages.new_system_message(f"Key not handled - {ch} -- {curses.keyname(ch).decode()}")
             return False
 
         # Scroll the window to follow the cursor (if needed)
@@ -347,105 +452,113 @@ class InputWindow(BaseWindow):
         return True
 
 
-class ChatUI:
+class AppUI:
     def __init__(self, stdscr):
         stdscr.nodelay(True)  # Make stdscr.getch() "non-blocking"
         self.stdscr = stdscr
 
-        # Create our "input window" to get user input
+        # Create an area/widget to get user input
         input_win = stdscr.subwin(5, curses.COLS, curses.LINES - 5, 0)
-        self.input_window = InputWindow(input_win)
+        self.input_widget = InputUIWidget(window=input_win, input_submitted_cb=self.handle_input_submitted)
 
-        # Create our "chat window" to show the chat messages
+        # Create an area/widget to show the chat messages
         chat_win = stdscr.subwin(curses.LINES - 5, curses.COLS, 0, 0)
-        self.chat_window = ChatWindow(chat_win)
+        self.chat_messages_widget = ScrollableTextUIWidget(chat_win)
 
-        self.focus_rotation = deque([self.chat_window, self.input_window])  # Focusable windows
+        # Widgets that can receive "focus" when the user presses the `tab` key
+        self.focus_rotation = deque([self.chat_messages_widget, self.input_widget])
 
     @property
-    def focused_window(self):
-        """The window that currently has focus."""
+    def focused_widget(self):
+        """The widget that currently has focus."""
         return self.focus_rotation[0]
 
     def rotate_focus(self):
-        """Rotate the window focus to the next window."""
+        """Rotate focus to the next widget."""
         self.focus_rotation.rotate(1)
         self.focus_rotation[-1].set_focus(False)
         self.focus_rotation[0].set_focus(True)
 
-    async def run(self):
-        """Runs the infinite UI loop."""
+    async def start(self):
+        """Starts & runs the UI indefinitely."""
         self.stdscr.refresh()
 
         while True:
             # Give up control for a bit (STRONG correlation between this value and CPU usage)
             await asyncio.sleep(0.01)
 
-            # Check the global message queue for any messages that need to appear in the chat window
-            if cm := messages.get_message():  # TODO: Put this into its own thing
-                self.chat_window.add_msg(cm)
-
             # Check for key-presses and handle them accordingly
             ch = self.stdscr.getch()
             if ch == curses.ERR:  # no key-press
                 continue
-            elif chr(ch) == "\t":  # `tab` key-press should rotate which window has focus
+            elif chr(ch) == "\t":  # `tab` key-press should rotate which widget has focus
                 self.rotate_focus()
             else:
-                await self.focused_window.handle_ch(ch)  # pass the key-press to whichever window has focus
+                await self.focused_widget.handle_ch(ch)  # pass the key-press to whichever widget has focus
 
-
-def create_ssl_context() -> ssl.SSLContext | None:
-    """Returns an SSL context to use based on the global RunConfig or None."""
-    if not config.ssl:
-        return None
-
-    if config.serve:
-        protocol = ssl.PROTOCOL_TLS_SERVER
-        default_certs = ssl.Purpose.CLIENT_AUTH
-    else:
-        protocol = ssl.PROTOCOL_TLS_CLIENT
-        default_certs = ssl.Purpose.SERVER_AUTH
-
-    c = ssl.SSLContext(protocol)
-    c.load_cert_chain(certfile=config.certfile)
-    c.load_verify_locations(cafile=config.cafile)
-    c.load_default_certs(default_certs)
-    c.verify_mode = ssl.CERT_REQUIRED
-    return c
-
-
-async def run_server():
-    """Starts the server and adds each incoming client connection to the global ConnectionManager."""
-    async def on_client_connected(reader: "StreamReader", writer: "StreamWriter"):
-        await connections.new_connection(reader=reader, writer=writer)
-
-    server = await asyncio.start_server(
-        client_connected_cb=on_client_connected,
-        host=config.host,
-        port=config.port,
-        ssl=create_ssl_context(),
-    )
-    async with server:
-        await messages.new_system_message("Server started...")
-        await server.serve_forever()
-
-
-async def run_client():
-    """Opens a client connection to the server and adds it to the global ConnectionManager."""
-    reader, writer = await asyncio.open_connection(host=config.host, port=config.port, ssl=create_ssl_context())
-    await messages.new_system_message(f"Connected to server {config.host}")
-    await connections.new_connection(reader=reader, writer=writer)
+    async def handle_input_submitted(self, text: str):
+        await events.publish(Events.UserInputSubmitted(text=text))
 
 
 async def main_app(stdscr):
     """Launch the PyChat UI and the (server or client)."""
-    ui = ChatUI(stdscr)
-    run_side = run_server if config.serve else run_client
+
+    ui = AppUI(stdscr)
+    network = Network()
+    user_uid = uuid.uuid4()
+
+    async def on_input_submitted(event: Events.UserInputSubmitted):
+        msg = Events.Message(uid=user_uid, text=event.text)
+        await events.publish(msg)
+
+    async def on_connection_events(event):
+        if isinstance(event, Events.ServerStarted):
+            text = f"Server started on {config.host}:{config.port}"
+        elif isinstance(event, Events.ConnectedToHost):
+            text = f"Connected to server {config.host}:{config.port}"
+        elif isinstance(event, Events.NewConnection):
+            text = f"New connection: remote_address {event.remote_address}"
+        elif isinstance(event, Events.LostConnection):
+            text = f"Connection ended: remote_address {event.remote_address}"
+        else:
+            raise TypeError
+        msg = Events.Message(uid=app_uid, text=text)
+        await events.publish(msg)
+
+    async def on_message(event: Events.Message):
+        ui.chat_messages_widget.add_msg(text=event.text, uid=event.uid)
+        if config.serve or event.uid == user_uid:
+            dt = DataType.SYS_MSG if event.uid == app_uid else DataType.MSG
+            await events.publish(Events.OutgoingData(type=dt, data=event.to_bytes(), exclude_ids={event.uid}))
+
+    async def on_outgoing_data(event: Events.OutgoingData):
+        await network.send(event.to_bytes(), exclude_ids=event.exclude_ids)
+
+    async def on_incoming_data(event: Events.IncomingData):
+        if event.data_type in (DataType.MSG, DataType.SYS_MSG):
+            msg = Events.Message.from_bytes(event.data[1:])
+            if config.serve:
+                msg.uid = event.cid  # Force a user's id to be the same as the connection id if we are the server
+            elif event.data_type == DataType.SYS_MSG:
+                msg.uid = app_uid
+            await events.publish(msg)
+
+    events.subscribe(on_input_submitted, Events.UserInputSubmitted)
+    events.subscribe(on_outgoing_data, Events.OutgoingData)
+    events.subscribe(on_incoming_data, Events.IncomingData)
+    events.subscribe(on_message, Events.Message)
+    events.subscribe(
+        on_connection_events,
+        Events.ServerStarted,
+        Events.ConnectedToHost,
+        Events.LostConnection,
+    )
+    if config.serve:
+        events.subscribe(on_connection_events, Events.NewConnection)
 
     async with asyncio.TaskGroup() as tg:
-        tg.create_task(ui.run())
-        tg.create_task(run_side())
+        tg.create_task(ui.start())
+        tg.create_task(network.start())
 
 
 def app_launcher(stdscr):
@@ -462,18 +575,14 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--host", action="store", help="Host of sever", default="0.0.0.0")
     parser.add_argument("-P", "--port", action="store", help="Port of sever", default="8080")
     parser.add_argument("-s", "--serve", action="store_true", help="Run the chat server for others to connect")
-    parser.add_argument("--debug", action="store_true", help="Turn on debug mode")
     parser.add_argument("--ssl", action="store_true", help="Use secure connection via SSL")
     parser.add_argument("--certfile", action="store", help="Path to SSL certificate", default="./client.pem")
     parser.add_argument("--cafile", action="store", help="Path to SSL certificate authority", default="./rootCA.pem")
     args = parser.parse_args()
 
     # Create some globals for convenience
-    config = RunConfig(**vars(args))
-    app_uid = uuid.uuid4()
-    user_uid = uuid.uuid4()
-    messages = MessageManager()
-    connections = ConnectionManager()
+    config = RunConfig(**vars(args))  # Global runtime configuration
+    app_uid = uuid.uuid4()  # Give pychat a UUID for when we create "system" messages
 
     # Launch the app
     curses.wrapper(app_launcher)
