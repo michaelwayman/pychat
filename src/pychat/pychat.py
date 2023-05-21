@@ -485,7 +485,7 @@ class BaseUIWidget:
         self.refresh()
 
     def scroll_down(self) -> None:
-        self.scroll = min(self.n_scrollable_lines, self.scroll + 1)
+        self.scroll = min(self.n_scrollable_lines - self.pad_height, self.scroll + 1)
         self.refresh()
 
     def reset_scroll(self) -> None:
@@ -550,13 +550,14 @@ class ScrollableTextUIWidget(BaseUIWidget):
            becomes visible
         """
         # Purge earlier text if we've reached the max scrollable lines
-        n_lines = text.count("\n")
+        text = text + "\n"
+        new_lines = text.count("\n")
         y, _ = self.pad.getyx()
-        if self.n_scrollable_lines - y <= n_lines:
-            self.purge_earliest(n_lines)
+        if self.n_scrollable_lines - y <= new_lines:
+            self.purge_earliest(new_lines)
 
         # Append the text by adding it to the pad
-        self.pad.addstr(text + "\n", color_pair)
+        self.pad.addstr(text, color_pair)
 
         # If the window doesn't currently have focus then scroll the window the newly added text
         if not self.focus:
@@ -635,6 +636,7 @@ class InputUIWidget(BaseUIWidget):
             return False
 
         # Scroll the window to follow the cursor (if needed)
+        y, x = self.pad.getyx()
         if y < self.scroll:
             self.scroll_up()
         elif y - self.pad_height >= self.scroll:
@@ -730,11 +732,11 @@ class AppUI:
 
         # Create an area/widget to get user input
         input_win = self.stdscr.subwin(5, curses.COLS, curses.LINES - 5, 0)
-        self.input_widget = InputUIWidget(window=input_win, input_submitted_cb=self.handle_input_submitted)
+        self.input_widget = InputUIWidget(window=input_win, n_scrollable_lines=8, input_submitted_cb=self.handle_input_submitted)
 
         # Create an area/widget to show the chat messages
         chat_win = self.stdscr.subwin(curses.LINES - 5, curses.COLS, 0, 0)
-        self.chat_messages_widget = ScrollableTextUIWidget(chat_win)
+        self.chat_messages_widget = ScrollableTextUIWidget(window=chat_win, n_scrollable_lines=32)
 
         # Widgets that can receive "focus" when the user presses the `tab` key
         self.focus_rotation = deque([self.chat_messages_widget, self.input_widget])
