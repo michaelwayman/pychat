@@ -2,11 +2,14 @@
 
 import argparse
 import asyncio
+import atexit
+import contextlib
 import curses
 import curses.ascii
 import curses.panel
 import dataclasses
 import enum
+import itertools
 import json
 import ssl
 import uuid
@@ -30,11 +33,10 @@ def debug():
 
 
 class JsonEncoder(json.JSONEncoder):
-
-    def default(self, value):
-        if isinstance(value, uuid.UUID):
-            return str(value)
-        return super().default(value)
+    def default(self, o):
+        if isinstance(o, uuid.UUID):
+            return str(o)
+        return super().default(o)
 
 
 class JsonDecoder(json.JSONDecoder):
@@ -42,13 +44,32 @@ class JsonDecoder(json.JSONDecoder):
         super().__init__(object_hook=self.object_hook, **kwargs)
 
     def object_hook(self, d: dict):
+        new_d = {}
         for k, v in d.items():
+            if isinstance(k, str):
+                with contextlib.suppress(ValueError):
+                    k = uuid.UUID(k)
+
             if isinstance(v, str):
-                try:
-                    d[k] = uuid.UUID(v)
-                except ValueError:
-                    pass
-        return d
+                with contextlib.suppress(ValueError):
+                    v = uuid.UUID(v)
+            elif isinstance(v, dict):
+                v = self.object_hook(v)
+
+            new_d[k] = v
+
+        return new_d
+
+
+def dict_factory(*args, **kwargs):
+    seq = args[0] if args else []
+    result = []
+    for key, value in itertools.chain(seq, kwargs.items()):
+        key = str(key)
+        if isinstance(value, dict):
+            value = {str(k): v for k, v in value.items()}
+        result.append((key, value))
+    return dict(result)
 
 
 @dataclass
@@ -58,10 +79,39 @@ class RunConfig:
     host: str
     port: str
     username: str
+    color: str
     serve: bool
     ssl: bool
     certfile: str
     cafile: str
+
+
+@dataclass
+class ConstructorMixin:
+    def __post_init__(self):
+        for field in dataclasses.fields(self):
+            val = getattr(self, field.name)
+            if val and isinstance(val, dict):
+                if dataclasses.is_dataclass(field.type):
+                    setattr(self, field.name, field.type(**val))
+                elif type_args := getattr(field.type, "__args__", None):
+                    if len(type_args) == 2 and dataclasses.is_dataclass(type_args[1]):
+                        for k, v in val.items():
+                            if isinstance(v, dict):
+                                val[k] = type_args[1](**v)
+
+
+@dataclass
+class User(ConstructorMixin):
+    uid: uuid.UUID
+    username: str
+    color: str
+
+
+@dataclass
+class ServerInfo(ConstructorMixin):
+    users: dict[uuid.UUID, User]
+    uid: uuid.UUID | None  # UUID of the local user
 
 
 class DataType(enum.IntEnum):
@@ -69,35 +119,23 @@ class DataType(enum.IntEnum):
 
 
 @dataclass
-class User:
-    uid: uuid.UUID
-    username: str
+class SendData:
+    type: DataType
+    data: bytes
 
+    def to_bytes(self):
+        return self.type.to_bytes(length=1, byteorder="big") + self.data
 
-@dataclass
-class ServerInfo:
-    users: list[User]
-
-    def update(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-
-
-@dataclass
-class ChatMessage:
-    uid: uuid.UUID
-    username: str
-    text: str
-
-
-@dataclass
-class SystemMessage:
-    text: str
+    @classmethod
+    def from_dataclass(cls, dc):
+        as_dict = dataclasses.asdict(dc, dict_factory=dict_factory)
+        as_dict["type"] = dc.__class__.__name__
+        as_str = json.dumps(as_dict, cls=JsonEncoder)
+        as_bytes = as_str.encode()
+        return cls(type=DataType.JSON, data=as_bytes)
 
 
 class Events:
-
     def __init__(self):
         self.subscribers = defaultdict(list)
 
@@ -110,6 +148,7 @@ class Events:
             for event in event_types:
                 self.subscribers[event].append(fn)
             return fn
+
         return wrapper
 
     async def push(self, event):
@@ -136,7 +175,7 @@ class Events:
         remote_address: str
 
     @dataclass
-    class IncomingData:
+    class ReceivedData:
         cid: uuid.UUID
         data: bytes
 
@@ -150,26 +189,23 @@ class Events:
             return as_dict
 
     @dataclass
-    class OutgoingData:
-        type: DataType
-        data: bytes
-        exclude: set[uuid.UUID] | None = None
-        include: set[uuid.UUID] | None = None
-
-        def to_bytes(self):
-            return self.type.to_bytes(length=1, byteorder="big") + self.data
-
-        @classmethod
-        def from_dataclass(cls, dc, exclude=None, include=None):
-            as_dict = dataclasses.asdict(dc)
-            as_dict["type"] = dc.__class__.__name__
-            as_str = json.dumps(as_dict, cls=JsonEncoder)
-            as_bytes = as_str.encode()
-            return cls(type=DataType.JSON, data=as_bytes, exclude=exclude, include=include)
-
-    @dataclass
     class UserInputSubmitted:
         text: str
+
+    @dataclass
+    class ChatMessage:
+        uid: uuid.UUID
+        text: str
+
+    @dataclass
+    class SystemMessage:
+        text: str
+
+    @dataclass
+    class JoinRequest:
+        username: str
+        color: str
+        cid: uuid.UUID | None = None
 
 
 events = Events()
@@ -191,7 +227,6 @@ class NetworkConnection:
         self.writer = writer
         self.write_queue = asyncio.Queue[bytes]()
         self.remote_address = writer.get_extra_info("peername", default=["Unknown"])[0]
-        self.username = None
 
     def __hash__(self):
         return hash(self.cid)
@@ -207,7 +242,7 @@ class NetworkConnection:
             data_size = await self.reader.readexactly(4)
             if data_size:
                 data = await self.reader.readexactly(int.from_bytes(data_size, byteorder="big"))
-                await events.push(Events.IncomingData(cid=self.cid, data=data))
+                await events.push(Events.ReceivedData(cid=self.cid, data=data))
             else:
                 raise ConnectionResetError
 
@@ -306,7 +341,7 @@ class Network:
             self.connections.remove(c)
             await events.push(Events.LostConnection(remote_address=c.remote_address, cid=c.cid))
 
-    async def send(self, data: bytes, exclude=None, include=None):
+    async def send(self, data: bytes, exclude: set[uuid.UUID] | None = None, include: set[uuid.UUID] | None = None):
         async with self.connection_lock:
             for connection in self.connections:
                 if include and connection.cid not in include:
@@ -317,10 +352,10 @@ class Network:
 
 
 class BaseUIWidget:
-    def __init__(self, w, n_lines=128):
-        self.background = w
-        self.height, self.width = w.getmaxyx()
-        self.beg_y, self.beg_x = w.getbegyx()
+    def __init__(self, window, n_lines=128):
+        self.background = window
+        self.height, self.width = window.getmaxyx()
+        self.beg_y, self.beg_x = window.getbegyx()
         self.pad_height = self.height - 2
         self.pad_width = self.width - 2
         self.pad = curses.newpad(n_lines, self.pad_width)
@@ -384,35 +419,10 @@ class BaseUIWidget:
 
 
 class ScrollableTextUIWidget(BaseUIWidget):
-    def __init__(self, stdscr, lines=128):
-        super().__init__(stdscr, lines)
-        # Init curses color pairs
-        curses.init_color(curses.COLOR_WHITE, 1000, 1000, 1000)
-        curses.init_pair(1, curses.COLOR_RED, curses.COLOR_WHITE)
-        curses.init_pair(2, curses.COLOR_BLUE, curses.COLOR_WHITE)
-        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)
-        curses.init_pair(4, curses.COLOR_MAGENTA, curses.COLOR_WHITE)
-        curses.init_pair(5, curses.COLOR_GREEN, curses.COLOR_WHITE)
-        curses.use_default_colors()
+    def __init__(self, window, lines=128):
+        super().__init__(window, lines)
 
-        # Maps a UUID -> a specific color so the same user shows as the same color each time
-        self.color_map = {
-            app_uid: curses.color_pair(0),
-        }
-
-    @cached_property
-    def next_color(self):
-        """A generator of color pairs"""
-        for n in range(1, 6):
-            yield curses.color_pair(n)
-
-    def get_user_color(self, uid: uuid.UUID):
-        """Returns the color to use for the given uid."""
-        if uid not in self.color_map:
-            self.color_map[uid] = next(self.next_color)
-        return self.color_map[uid]
-
-    def add_msg(self, text: str, uid: uuid.UUID):
+    def append_text(self, text: str, color_pair):
         """Adds a new message to show for the user."""
         msg = text.strip()
         # Purge earlier messages if we've reached the max history length
@@ -422,7 +432,7 @@ class ScrollableTextUIWidget(BaseUIWidget):
             self.purge_earliest(n_lines)
 
         # Show the message by adding it to the pad
-        self.pad.addstr(" > " + msg + "\n", self.get_user_color(uid))
+        self.pad.addstr(text + "\n", color_pair)
 
         # If the window doesn't currently have focus then go ahead and scroll the window
         # to make the latest message visible
@@ -505,21 +515,74 @@ class InputUIWidget(BaseUIWidget):
         return True
 
 
+class UIColors:
+    def __init__(self):
+        self._color_number = iter(range(8, curses.COLORS))
+        self._pair_number = iter(range(1, curses.COLOR_PAIRS))
+        self.colors = {}
+        self.color_pairs = {}
+
+    @classmethod
+    def hex_to_curses_tuple(cls, color: str):
+        r, g, b = color[0:2], color[2:4], color[4:6]
+        r, g, b = int(r, 16), int(g, 16), int(b, 16)
+        curses_ratio = 1000 / 255
+        r, g, b = int(r * curses_ratio), int(g * curses_ratio), int(b * curses_ratio)
+        return r, g, b
+
+    def get_color(self, color: str):
+        if color not in self.colors:
+            color_number = next(self._color_number)
+            curses.init_color(color_number, *self.hex_to_curses_tuple(color))
+            self.colors[color] = color_number
+        return self.colors[color]
+
+    def get_pair(self, fg_color: str, bg_color: str):
+        pair = (fg_color, bg_color)
+        if pair not in self.color_pairs:
+            pair_number = next(self._pair_number)
+            fg = self.get_color(fg_color)
+            bg = self.get_color(bg_color)
+            curses.init_pair(pair_number, fg, bg)
+            self.color_pairs[pair] = pair_number
+        return curses.color_pair(self.color_pairs[pair])
+
+
 class AppUI:
-    def __init__(self, stdscr):
-        stdscr.nodelay(True)  # Make stdscr.getch() "non-blocking"
-        self.stdscr = stdscr
+    def __init__(self):
+        self.stdscr = self.init_curses()
+
+        self.colors = UIColors()
 
         # Create an area/widget to get user input
-        input_win = stdscr.subwin(5, curses.COLS, curses.LINES - 5, 0)
+        input_win = self.stdscr.subwin(5, curses.COLS, curses.LINES - 5, 0)
         self.input_widget = InputUIWidget(window=input_win, input_submitted_cb=self.handle_input_submitted)
 
         # Create an area/widget to show the chat messages
-        chat_win = stdscr.subwin(curses.LINES - 5, curses.COLS, 0, 0)
+        chat_win = self.stdscr.subwin(curses.LINES - 5, curses.COLS, 0, 0)
         self.chat_messages_widget = ScrollableTextUIWidget(chat_win)
 
         # Widgets that can receive "focus" when the user presses the `tab` key
         self.focus_rotation = deque([self.chat_messages_widget, self.input_widget])
+
+    @staticmethod
+    def init_curses():
+        @atexit.register
+        def cleanup():
+            stdscr.keypad(False)
+            curses.echo()
+            curses.nocbreak()
+            curses.endwin()
+
+        stdscr = curses.initscr()
+        stdscr.nodelay(True)  # Make stdscr.getch() "non-blocking"
+        curses.noecho()
+        curses.cbreak()
+        stdscr.keypad(True)
+        with contextlib.suppress(Exception):
+            curses.start_color()
+        curses.use_default_colors()
+        return stdscr
 
     @property
     def focused_widget(self):
@@ -552,87 +615,128 @@ class AppUI:
     async def handle_input_submitted(self, text: str):
         await events.push(Events.UserInputSubmitted(text=text))
 
+    def add_user_message(self, text: str, user: User):
+        text = f"{user.username:>10}:  {text}"
+        self.chat_messages_widget.append_text(text=text, color_pair=self.colors.get_pair(user.color, "ffffff"))
 
-async def send_dataclass(dc, exclude=None, include=None) -> None:
-    data = Events.OutgoingData.from_dataclass(dc, exclude=exclude, include=include)
-    await events.push(data)
+    def add_system_message(self, text: str):
+        self.chat_messages_widget.append_text(text=text, color_pair=curses.color_pair(0))
 
 
-async def system_message(text: str):
-    msg = SystemMessage(text=text)
+class App:
+    def __init__(self):
+        self.ui = AppUI()
+        self.network = Network()
+        self.server_info = None
+
+        if config.serve:
+            user_uid = uuid.uuid4()
+            users = {user_uid: User(uid=user_uid, username=config.username, color=config.color)}
+            self.server_info = ServerInfo(users=users, uid=user_uid)
+
+    @property
+    def user_id(self) -> uuid.UUID | None:
+        return self.server_info.uid
+
+    def get_user(self, uid: uuid.UUID | None = None) -> User:
+        if not uid:
+            uid = self.user_id
+        return self.server_info.users[uid]
+
+    async def run_forever(self):
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self.ui.start())
+            tg.create_task(self.network.start())
+
+    async def send_dataclass(self, dc, exclude: set[uuid.UUID] | None = None, include: set[uuid.UUID] | None = None):
+        data = SendData.from_dataclass(dc)
+        await self.network.send(data.to_bytes(), exclude=exclude, include=include)
+
+    async def system_message(self, text: str, send_to_channel=False):
+        msg = Events.SystemMessage(text=text)
+        await events.push(msg)
+        if send_to_channel:
+            await self.send_dataclass(msg)
+
+    async def sync_server_info(self):
+        for uid, user in self.server_info.users.items():
+            si = dataclasses.replace(self.server_info, uid=uid)
+            await self.send_dataclass(si, include={uid})
+
+
+@events.register(Events.UserInputSubmitted)
+async def on_input_submitted(event: Events.UserInputSubmitted):
+    msg = Events.ChatMessage(uid=app.user_id, text=event.text)
     await events.push(msg)
 
 
-async def main_app(stdscr):
-    """Launch the PyChat UI and the (server or client)."""
+@events.register(Events.ServerStarted)
+async def on_server_started(event: Events.ServerStarted):
+    await app.system_message(f"Server started on {config.host}:{config.port}")
 
-    ui = AppUI(stdscr)
-    network = Network()
-    user_uid = uuid.uuid4()
 
-    server_info = ServerInfo(users=[User(uid=user_uid, username=config.username)])
+@events.register(Events.ConnectedToHost)
+async def on_connected_to_host(event: Events.ConnectedToHost):
+    await app.system_message(f"Connected to server {config.host}:{config.port}")
+    await app.send_dataclass(Events.JoinRequest(username=config.username, color=config.color))
 
-    @events.register(Events.UserInputSubmitted)
-    async def on_input_submitted(event: Events.UserInputSubmitted):
-        msg = ChatMessage(uid=user_uid, username=config.username, text=event.text)
-        await events.push(msg)
 
-    @events.register(Events.ServerStarted)
-    async def on_server_started(event: Events.ServerStarted):
-        await system_message(f"Server started on {config.host}:{config.port}")
+@events.register(Events.ChatMessage)
+async def on_chat_message(event: Events.ChatMessage):
+    app.ui.add_user_message(text=event.text, user=app.get_user(event.uid))
+    if config.serve or event.uid == app.user_id:
+        await app.send_dataclass(event, exclude={event.uid})
 
-    @events.register(Events.ConnectedToHost)
-    async def on_connected_to_host(event: Events.ConnectedToHost):
-        await system_message(f"Connected to server {config.host}:{config.port}")
 
-    @events.register(Events.OutgoingData)
-    async def on_outgoing_data(event: Events.OutgoingData):
-        await network.send(event.to_bytes(), exclude=event.exclude, include=event.include)
+@events.register(Events.SystemMessage)
+async def on_system_message(event: Events.SystemMessage):
+    app.ui.add_system_message(text=event.text)
 
-    @events.register(Events.IncomingData)
-    async def on_incoming_data(event: Events.IncomingData):
-        if event.data_type == DataType.JSON:
-            json_data = event.json()
-            type = json_data.pop("type")
-            if type == "ServerInfo":
-                server_info.update(**json_data)
-            elif type == "ChatMessage":
-                msg = ChatMessage(**json_data)
-                if config.serve:
-                    msg.uid = event.cid
-                await events.push(msg)
 
-    @events.register(ChatMessage)
-    async def on_chat_message(event: ChatMessage):
-        ui.chat_messages_widget.add_msg(text=event.text, uid=event.uid)
-        if config.serve or event.uid == user_uid:
-            await send_dataclass(event, exclude={event.uid})
+@events.register(Events.NewConnection)
+async def on_new_connection(event: Events.NewConnection):
+    await app.system_message(f"New connection: remote_address {event.remote_address}")
 
-    @events.register(SystemMessage)
-    async def on_system_message(event: SystemMessage):
-        ui.chat_messages_widget.add_msg(text=event.text, uid=app_uid)
 
-    @events.register(Events.LostConnection)
-    async def on_lost_connection(event: Events.LostConnection):
-        await system_message(f"Connection ended: remote_address {event.remote_address}")
-
+@events.register(Events.JoinRequest)
+async def on_join_request(event: Events.JoinRequest):
     if config.serve:
-        @events.register(Events.NewConnection)
-        async def on_new_connection(event: Events.NewConnection):
-            await system_message(f"New connection: remote_address {event.remote_address}")
-            await send_dataclass(server_info, include={event.cid})
-
-    async with asyncio.TaskGroup() as tg:
-        tg.create_task(ui.start())
-        tg.create_task(network.start())
+        user = User(uid=event.cid, username=event.username, color=event.color)
+        app.server_info.users[user.uid] = user
+        await app.sync_server_info()
+        await app.system_message(f"{event.username} joined the chat", send_to_channel=True)
 
 
-def app_launcher(stdscr):
-    """Launch the asyncio app."""
-    try:
-        asyncio.run(main_app(stdscr))
-    except KeyboardInterrupt:
-        pass
+@events.register(Events.ReceivedData)
+async def on_received_data(event: Events.ReceivedData):
+    if event.data_type != DataType.JSON:
+        return
+    json_data = event.json()
+    type = json_data.pop("type")
+    if type == Events.ChatMessage.__name__:
+        msg = Events.ChatMessage(**json_data)
+        if config.serve:
+            msg.uid = event.cid
+        await events.push(msg)
+    if config.serve:
+        if type == Events.JoinRequest.__name__:
+            json_data["cid"] = event.cid
+            await events.push(Events.JoinRequest(**json_data))
+    else:
+        if type == ServerInfo.__name__:
+            app.server_info = ServerInfo(**json_data)
+        elif type == Events.SystemMessage.__name__:
+            sm = Events.SystemMessage(**json_data)
+            await app.system_message(text=sm.text)
+
+
+@events.register(Events.LostConnection)
+async def on_lost_connection(event: Events.LostConnection):
+    await app.system_message(f"Connection ended: remote_address {event.remote_address}")
+    if config.serve:
+        user = app.server_info.users.pop(event.cid)
+        await app.sync_server_info()
+        await app.system_message(f"{user.username} left the chat.", send_to_channel=True)
 
 
 if __name__ == "__main__":
@@ -641,15 +745,22 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--host", action="store", help="Host of sever", default="0.0.0.0")
     parser.add_argument("-P", "--port", action="store", help="Port of sever", default="8080")
     parser.add_argument("-u", "--username", action="store", help="Display name to use in the chat", default="Anonymous")
+    parser.add_argument(
+        "-c", "--color", action="store", help="Display color to use for your messages", default="000000"
+    )
     parser.add_argument("-s", "--serve", action="store_true", help="Run the chat server for others to connect")
     parser.add_argument("--ssl", action="store_true", help="Use secure connection via SSL")
     parser.add_argument("--certfile", action="store", help="Path to SSL certificate", default="./client.pem")
     parser.add_argument("--cafile", action="store", help="Path to SSL certificate authority", default="./rootCA.pem")
-    args = parser.parse_args()
+    parsed_args = parser.parse_args()
 
-    # Create some globals for convenience
-    config = RunConfig(**vars(args))  # Global runtime configuration
-    app_uid = uuid.uuid4()  # Give pychat a UUID for when we create "system" messages
+    config = RunConfig(**vars(parsed_args))  # Global runtime configuration
 
     # Launch the app
-    curses.wrapper(app_launcher)
+    try:
+        app = App()
+        asyncio.run(app.run_forever())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pass
