@@ -16,7 +16,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
@@ -91,7 +91,7 @@ class RunConfig:
 class JsonTransferable:
     """Base class for dataclasses that can be sent across the wire as json bytes."""
 
-    _subclasses = {}  # Maps class names to the class for all subclasses
+    _subclasses: ClassVar[dict] = {}  # Maps class names to the class for all subclasses
 
     def __init_subclass__(cls, **kwargs):
         JsonTransferable._subclasses[cls.__name__] = cls
@@ -131,6 +131,7 @@ class JsonTransferable:
 @dataclass
 class User(JsonTransferable):
     """Represents a user in the app."""
+
     uid: uuid.UUID
     username: str
     color: str
@@ -143,6 +144,7 @@ class User(JsonTransferable):
 @dataclass
 class JoinRequest(JsonTransferable):
     """Once a client connects to the server, it sends one of these to get added as a new User."""
+
     username: str
     color: str
 
@@ -150,13 +152,15 @@ class JoinRequest(JsonTransferable):
 @dataclass
 class ServerInfo(JsonTransferable):
     """Some data about the chat, the connected users, their preferred color, etc."""
+
     users: dict[uuid.UUID, User]
-    uid: uuid.UUID | None  # UUID assigned to the user receiving this obj
+    uid: uuid.UUID  # UUID assigned to the user receiving this obj
 
 
 @dataclass
 class ChatMessage(JsonTransferable):
     """Represents a user-typed message that sends and displays to everyone."""
+
     uid: uuid.UUID
     text: str
 
@@ -164,17 +168,20 @@ class ChatMessage(JsonTransferable):
 @dataclass
 class SystemMessage(JsonTransferable):
     """A message from the "app", when someone joins or leaves, connection established, etc."""
+
     text: str
 
 
 class SendDataType(enum.IntEnum):
     """Type of data being sent across the wire."""
+
     JSON = enum.auto()
 
 
 @dataclass
 class SendData:
     """This object wraps the data that we plan to send across the wire."""
+
     type: SendDataType
     data: bytes
 
@@ -195,6 +202,7 @@ class Events:
 
      Due to this app being a single-file, I've namespaced all pushable events to this class.
     """
+
     def __init__(self):
         self.handlers = defaultdict(list)
         self.handlers__client = defaultdict(list)
@@ -218,9 +226,11 @@ class Events:
 
     def register(self, *event_types, server_only=False, client_only=False):
         """Decorator version of subscribe."""
+
         def wrapper(fn):
             self.subscribe(fn, *event_types, server_only=server_only, client_only=client_only)
             return fn
+
         return wrapper
 
     def get_event_handlers(self, event):
@@ -249,18 +259,21 @@ class Events:
     @dataclass
     class EstablishedConnection:
         """A new connection has been established and added to the network."""
+
         cid: uuid.UUID
         remote_address: str
 
     @dataclass
     class LostConnection:
         """A connection has been lost and removed from the network."""
+
         cid: uuid.UUID
         remote_address: str
 
     @dataclass
     class ReceivedData:
         """Data has been received from the wire."""
+
         cid: uuid.UUID
         data: bytes
 
@@ -276,6 +289,7 @@ class Events:
     @dataclass
     class UserInputSubmitted:
         """The user has submitted some text input."""
+
         text: str
 
 
@@ -355,6 +369,7 @@ class Network:
      - Sending/receiving data
      - SSL
     """
+
     def __init__(self) -> None:
         self.connections: set[NetworkConnection] = set()
         self.connection_lock = asyncio.Lock()  # lock to access connections
@@ -455,6 +470,7 @@ class BaseUIWidget:
      - Giving "focus" (when in focus widget has a padded border)
      - Scrolling
     """
+
     def __init__(self, window, n_scrollable_lines: int = 128) -> None:
         """
         window: the window to draw this widget in (widget will assume full size of window)
@@ -689,8 +705,7 @@ class UIColors:
         "cccccc" -> (800, 800, 800)
         """
         color = cls.clean_color(color)
-        r, g, b = color[0:2], color[2:4], color[4:6]
-        r, g, b = int(r, 16), int(g, 16), int(b, 16)
+        r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
         curses_ratio = 1000 / 255
         r, g, b = int(r * curses_ratio), int(g * curses_ratio), int(b * curses_ratio)
         return r, g, b
@@ -732,7 +747,7 @@ class AppUI:
 
         # Create an area/widget to get user input
         input_win = self.stdscr.subwin(5, curses.COLS, curses.LINES - 5, 0)
-        self.input_widget = InputUIWidget(window=input_win, n_scrollable_lines=8, input_submitted_cb=self.handle_input_submitted)
+        self.input_widget = InputUIWidget(window=input_win, input_submitted_cb=self.handle_input_submitted)
 
         # Create an area/widget to show the chat messages
         chat_win = self.stdscr.subwin(curses.LINES - 5, curses.COLS, 0, 0)
@@ -869,7 +884,7 @@ class App:
     async def chat_message(self, cm: ChatMessage):
         """Append a new chat message to make visible in the UI & send it across the network when appropriate."""
         self.ui.append_user_message(text=cm.text, user=self.users[cm.uid])
-        if config.serve or cm.uid == self.user.uid:
+        if config.serve or self.user and cm.uid == self.user.uid:
             await self.send_dataclass(cm, exclude={cm.uid})
 
     async def send_server_info(self):
@@ -887,6 +902,7 @@ class App:
 
 @events.register(Events.UserInputSubmitted)
 async def on_input_submitted(event: Events.UserInputSubmitted):
+    assert app.user is not None
     await app.chat_message(ChatMessage(uid=app.user.uid, text=event.text))
 
 
