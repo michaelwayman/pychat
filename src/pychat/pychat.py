@@ -16,19 +16,20 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Callable, ClassVar
 
 if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
 
 
-def debug():
+def debug(clear_curses=True):
     """Helps with debugging while curses app is running."""
     import pdb
 
-    curses.echo()
-    curses.nocbreak()
-    curses.endwin()
+    if clear_curses:
+        curses.echo()
+        curses.nocbreak()
+        curses.endwin()
     pdb.set_trace()
 
 
@@ -534,17 +535,17 @@ class BaseUIWidget:
 
     def set_focus(self, focus: bool) -> None:
         """Set the focus of the window."""
-        if focus == self.focus:
+        if self.focus == focus:
             return
 
-        if focus:
+        self.focus = focus
+        if self.focus:
             self.background.border()  # Add border
         else:
             self.background.clear()  # Remove border
             self.reset_scroll()
         self.background.refresh()
         self.refresh()
-        self.focus = focus
 
 
 class ScrollableTextUIWidget(BaseUIWidget):
@@ -581,19 +582,46 @@ class ScrollableTextUIWidget(BaseUIWidget):
         self.refresh()
 
 
+class InputUIWidgetPlaceholder:
+    """Works in tandem with InputUIWidget to allow setting 'placeholder' text on the input widget."""
+
+    def __init__(self, window, text: str | Callable, color_pair):
+        """
+        window: area for the placeholder text to sit
+        text: the text to use for the placeholder (can be a string or callable)
+        color_pair: the color pair to use for the placeholder text
+        """
+        self.window = window
+        self.text = text
+        self.color_pair = color_pair
+
+    def show(self):
+        """Sets the placeholder text and touches the window."""
+        text = self.text if isinstance(self.text, str) else self.text()
+        self.window.erase()
+        self.window.addstr(text, self.color_pair)
+        self.window.move(0, 0)
+        self.window.refresh()
+        self.window.touchwin()
+
+
 class InputUIWidget(BaseUIWidget):
     """Widget to get multi-line scrollable input from the user."""
 
-    def __init__(self, window, input_submitted_cb, n_scrollable_lines: int = 128, clear_on_submit: bool = True):
+    def __init__(self, window, input_submitted_cb, n_scrollable_lines: int = 128):
         """
         window: the window to draw this widget in (widget will assume full size of window)
         n_scrollable_lines: the number of scrollable lines (internal pad height)
         input_submitted_cb: callback function for when input is submitted
-        clear_on_submit: whether to wipe the pad clean when input is submitted
         """
         super().__init__(window, n_scrollable_lines)
         self.input_submitted_cb = input_submitted_cb
-        self.clear_on_submit = clear_on_submit
+        self.placeholder: InputUIWidgetPlaceholder | None = None
+
+    def add_placeholder(self, text: str | Callable, color_pair):
+        """Add placeholder text to this input widget."""
+        ph_win = curses.newwin(self.pad_height, self.pad_width, self.pad_beg_y, self.pad_beg_x)
+        self.placeholder = InputUIWidgetPlaceholder(window=ph_win, color_pair=color_pair, text=text)
 
     async def handle_ch__return(self):
         """Handles the return/enter keypress."""
@@ -603,19 +631,27 @@ class InputUIWidget(BaseUIWidget):
         else:
             self.input_submitted_cb(text)
 
-        if self.clear_on_submit:
-            self.pad.erase()
-            self.pad.move(0, 0)
+        self.pad.erase()
+        self.pad.move(0, 0)
 
     def get_text(self) -> str:
         """Returns all the text in the pad."""
+        initial_cursor = self.pad.getyx()
         all_lines = []
         for y in range(0, self.n_scrollable_lines):
             chars = []
             for x in range(0, self.pad_width - 1):
                 chars.append(chr(curses.ascii.ascii(self.pad.inch(y, x))))
             all_lines.append("".join(chars).rstrip())
-        return "\n".join(all_lines)
+        self.pad.move(*initial_cursor)
+        return "\n".join(all_lines).strip()
+
+    def refresh(self) -> None:
+        super().refresh()
+        # Show the placeholder text if the input is empty and the cursor is at the origin
+        if getattr(self, "placeholder", None):
+            if self.get_text() == "" and self.pad.getyx() == (0, 0):
+                self.placeholder.show()
 
     async def handle_ch(self, ch: int) -> bool:
         """Handles a keypress of `ch` and returns whether the key was handled."""
@@ -748,6 +784,10 @@ class AppUI:
         # Create an area/widget to get user input
         input_win = self.stdscr.subwin(5, curses.COLS, curses.LINES - 5, 0)
         self.input_widget = InputUIWidget(window=input_win, input_submitted_cb=self.handle_input_submitted)
+        self.input_widget.add_placeholder(
+            text=self.get_input_placeholder_text,
+            color_pair=self.colors.get_pair("555555", bg_color="000000"),
+        )
 
         # Create an area/widget to show the chat messages
         chat_win = self.stdscr.subwin(curses.LINES - 5, curses.COLS, 0, 0)
@@ -755,6 +795,10 @@ class AppUI:
 
         # Widgets that can receive "focus" when the user presses the `tab` key
         self.focus_rotation = deque([self.chat_messages_widget, self.input_widget])
+
+        self.stdscr.refresh()
+        self.chat_messages_widget.refresh()
+        self.input_widget.refresh()
 
     @staticmethod
     def init_curses():
@@ -784,6 +828,11 @@ class AppUI:
         """The widget that currently has focus."""
         return self.focus_rotation[0]
 
+    def get_input_placeholder_text(self):
+        if self.input_widget.focus:
+            return "Begin typing your message... Press `return` to send."
+        return "This is where you type your message. Press `tab` to rotate focus."
+
     def rotate_focus(self):
         """Rotate focus to the next widget."""
         self.focus_rotation.rotate(1)
@@ -792,7 +841,6 @@ class AppUI:
 
     async def run_forever(self):
         """Starts & runs the UI indefinitely."""
-        self.stdscr.refresh()
 
         while True:
             # Give up control for a bit (STRONG correlation between this value and CPU usage)
@@ -808,7 +856,7 @@ class AppUI:
                 await self.focused_widget.handle_ch(ch)  # pass the key-press to whichever widget has focus
 
     async def handle_input_submitted(self, text: str):
-        """Callback for the the user submits some text."""
+        """Callback for when the user submits some text."""
         await events.push(Events.UserInputSubmitted(text=text))
 
     def append_user_message(self, text: str, user: User):
@@ -966,13 +1014,23 @@ async def on_received_data__client(event: Events.ReceivedData):
 
 if __name__ == "__main__":
     # Get command-line run options
-    parser = argparse.ArgumentParser(description="PyChat :)")
+    parser = argparse.ArgumentParser(
+        description=(
+            "PyChat :)\n\n"
+            "PyChat is a terminal based multi-user, SSL enabled, chat application.\n\n"
+            "Within the app:\n"
+            "A widget must be 'in focus' to receive and respond to key-presses.\n"
+            "In other words, you must give focus to the input widget before typing your message.\n\n"
+            "The `tab` key rotates focus between UI widgets\n"
+            "The `return` key sends your typed message\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("-H", "--host", action="store", help="Host of sever", default="0.0.0.0")
     parser.add_argument("-P", "--port", action="store", help="Port of sever", default="8080")
     parser.add_argument("-u", "--username", action="store", help="Display name to use in the chat", default="Anonymous")
-    parser.add_argument(
-        "-c", "--color", action="store", help="Display color to use for your messages", default="000000"
-    )
+    color_help = "Display color to use for your messages. (6 character hex string)"
+    parser.add_argument("-c", "--color", action="store", help=color_help, default="000000")
     parser.add_argument("-s", "--serve", action="store_true", help="Run the chat server for others to connect")
     parser.add_argument("--ssl", action="store_true", help="Use secure connection via SSL")
     parser.add_argument("--certfile", action="store", help="Path to SSL certificate", default="./client.pem")
