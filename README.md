@@ -1,12 +1,30 @@
 # PyChat
 
-A terminal-based chat application written in python.
+A **terminal-based chat application** written in python.
 
 It is meant for demo/educational purposes and not for real-world adoption.
 
-Check out the demo video at the bottom of this file and check out the [wiki](https://github.com/michaelwayman/pychat/wiki) for latest info
+**Check out the demo video at the bottom** and also the [wiki](https://github.com/michaelwayman/pychat/wiki)
 
-**Highlights:**
+- [Intro](#intro)
+  - [Highlights](#highlights)
+  - [Requirements](#requirements)
+  - [Project origin](#project-origin)
+  - [PyChat concepts](#pychat-concepts)
+- [How to use](#how-to-use)
+  - [Things to know](#things-to-know)
+  - [SSL mode](#ssl-mode)
+    - [SSL example](#ssl-example)
+    - [Generate SSL certificates](#generate-ssl-certificates)
+  - [Full usage](#full-usage)
+- [Demo reel](#demo-reel)
+- [High level architecture](#high-level-architecture)
+
+## Intro
+
+Hello. Thanks for stopping bye. Drop me a line.
+
+### Highlights
  - multiple users
  - customize how people see you
  - SSL encryption
@@ -14,15 +32,49 @@ Check out the demo video at the bottom of this file and check out the [wiki](htt
  - 0 external dependencies
  - single file
 
-**Requirements:**
+### Requirements
  - `python >= 3.11`
+
+
+### Project origin
+
+I started out wanting to do a small project that demonstrates some of my coding ability and my well rounded knowledge of computer systems.
+
+Deciding on the right project was a challenge. With so much open-source code, it's now possible to make something really cool without _actually_ having much skill or knowledge. That is why I choose not to use any 3rd party libraries for PyChat.
+
+So, what is something small enough that 1 person can build, cool enough that I'd want to build it, and complicated enough that several problems need solved all in 1 project? The answer is PyChat.
+
+### PyChat concepts
+
+To build PyChat it requires understanding or building each of the following
+
+- Concurrency
+   - Blocking & nonblocking
+   - Queues
+   - Coroutines & threads (threads is coming-soon going to put the UI loop into a thread of its own)
+ - Network socket IO
+   - Managing multiple connections
+   - A client/server communication spec
+   - SSL
+ - Cryptography
+ - Shell scripting
+ - Terminal GUI & UI concepts
+ - Terminal CLI and application design
+ - Event-driven applications
+   - Pub/Sub concepts
+ - Object serialization & JSON
+ - "Advanced" python
+
+All baked into a single file program, no external dependencies, just python and the standard lib.
+
+**How's THAT for a demo project?!?**
 
 ___
 
 ## How to use
 
 
-1. Someone runs the PyChat server
+1. Someone runs the server
    1. `pychat.py --serve --host 0.0.0.0 --port 8080`
 2. Others connect to the server
    1. `pychat.py --host 25.13.23.12 --port 8080`
@@ -36,13 +88,13 @@ ___
 
 ### SSL mode
 
-The host may run the server in SSL mode.
+The host can run the server in **SSL mode**.
 
 Both the server and client must give valid certificates to connect via SSL.
 
 I've included a script generates a self-signed CA (certificate of authority) and issue validation certificates, see next section.
 
-Note: PyChat expects certfiles to combine the private key and certificate into a single file like so
+Note: PyChat expects certfiles to **combine the private key and certificate into a single file** like so
 ```
 -----BEGIN PRIVATE KEY-----
 ...
@@ -55,7 +107,7 @@ Note: PyChat expects certfiles to combine the private key and certificate into a
 Note: For the central authority (CA) you shouldn't comvine the key and cert. Only the cert is used to confirm others and only the cert should be shared.
 The CA key should be kept offline, air-gapped, in a dry-cool-place. The key is only needed to issue new certificates. 
 
-#### Running SSL encryption looks like this:
+#### SSL example
 
 ```shell
 # Server
