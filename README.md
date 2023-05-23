@@ -2,7 +2,9 @@
 
 A terminal-based chat application written in python.
 
-It is meant for demo/educational purposes and not for real-world adoption. 
+It is meant for demo/educational purposes and not for real-world adoption.
+
+Check out the demo video at the bottom of this file and check out the [wiki](https://github.com/michaelwayman/pychat/wiki) for latest info
 
 **Highlights:**
  - multiple users
@@ -20,7 +22,6 @@ ___
 ## How to use
 
 
-### Example steps
 1. Someone runs the PyChat server
    1. `pychat.py --serve --host 0.0.0.0 --port 8080`
 2. Others connect to the server
@@ -115,3 +116,15 @@ options:
   --certfile CERTFILE   Path to SSL certificate
   --cafile CAFILE       Path to SSL certificate authority
 ```
+
+___
+
+## Demo reel
+
+[pychat-demo.webm](https://github.com/michaelwayman/pychat/assets/5776784/943e18ae-e482-4115-835c-1e6ab7b9695e)
+
+___
+
+## High level architecture
+
+![high-level-md](https://github.com/michaelwayman/pychat/assets/5776784/23736bea-3a2b-4fe7-b300-d6baf4c57aa3)
