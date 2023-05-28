@@ -12,6 +12,7 @@ import enum
 import itertools
 import json
 import ssl
+import typing
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -20,58 +21,6 @@ from typing import TYPE_CHECKING, Callable, ClassVar
 
 if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
-
-
-def debug(clear_curses=True):
-    """Helps with debugging while curses app is running."""
-    import pdb
-
-    if clear_curses:
-        curses.echo()
-        curses.nocbreak()
-        curses.endwin()
-    pdb.set_trace()
-
-
-class JsonEncoder(json.JSONEncoder):
-    def default(self, o):
-        """Help convert objects for serialization"""
-        if isinstance(o, uuid.UUID):
-            return str(o)
-        return super().default(o)
-
-
-class JsonDecoder(json.JSONDecoder):
-    def __init__(self, **kwargs):
-        super().__init__(object_hook=self.object_hook, **kwargs)
-
-    def object_hook(self, d: dict):
-        new_d = {}
-        for k, v in d.items():
-            if isinstance(k, str):
-                with contextlib.suppress(ValueError):
-                    k = uuid.UUID(k)
-            if isinstance(v, str):
-                with contextlib.suppress(ValueError):
-                    v = uuid.UUID(v)
-            elif isinstance(v, dict):
-                v = self.object_hook(v)
-
-            new_d[k] = v
-
-        return new_d
-
-
-def dict_factory(*args, **kwargs):
-    """Returns a dictionary where every key has been make a string."""
-    seq = args[0] if args else []
-    result = []
-    for key, value in itertools.chain(seq, kwargs.items()):
-        key = str(key)
-        if isinstance(value, dict):
-            value = {str(k): v for k, v in value.items()}
-        result.append((key, value))
-    return dict(result)
 
 
 @dataclass
@@ -88,6 +37,31 @@ class RunConfig:
     cafile: str
 
 
+def debug(clear_curses=True):
+    """Helps with debugging while curses app is running."""
+    import pdb
+
+    if clear_curses:
+        curses.echo()
+        curses.nocbreak()
+        curses.endwin()
+    pdb.set_trace()
+
+
+def dict_factory(*args, **kwargs):
+    """A dictionary constructor to return a serializable dictionary."""
+    seq = args[0] if args else []
+    result = []
+    for key, value in itertools.chain(seq, kwargs.items()):
+        key = str(key)  # Convert all keys to strings
+        if isinstance(value, dict):
+            value = dict_factory(value.items())
+        elif isinstance(value, uuid.UUID):  # Convert UUIDs to strings
+            value = str(value)
+        result.append((key, value))
+    return dict(result)
+
+
 @dataclass
 class JsonTransferable:
     """Base class for dataclasses that can be sent across the wire as json bytes."""
@@ -97,12 +71,6 @@ class JsonTransferable:
     def __init_subclass__(cls, **kwargs):
         JsonTransferable._subclasses[cls.__name__] = cls
 
-    @classmethod
-    def from_json(cls, json_data: dict):
-        type = json_data.pop("type")
-        obj_class = cls._subclasses[type]
-        return obj_class(**json_data)
-
     def __post_init__(self):
         """
         Attempts some basic type coercion to recreate the expected types of the dataclass.
@@ -110,21 +78,40 @@ class JsonTransferable:
         Useful when going from JSON back to object instances (I chose not to use pickle)
         """
         for field in dataclasses.fields(self):
-            val = getattr(self, field.name)
-            if val and isinstance(val, dict):
-                if dataclasses.is_dataclass(field.type):
-                    setattr(self, field.name, field.type(**val))
-                elif type_args := getattr(field.type, "__args__", None):
-                    if len(type_args) == 2 and dataclasses.is_dataclass(type_args[1]):
-                        for k, v in val.items():
-                            if isinstance(v, dict):
-                                val[k] = type_args[1](**v)
+            setattr(self, field.name, self._type_coerce(getattr(self, field.name), field.type))
 
-    def to_bytes(self):
+    @classmethod
+    def from_json(cls, json_data: dict):
+        type = json_data.pop("type")
+        obj_class = cls._subclasses[type]
+        return obj_class(**json_data)
+
+    @classmethod
+    def _type_coerce(cls, value, type):
+        """Coerce the value to the given type, covers the use cases we care about."""
+        type_origin = typing.get_origin(type)
+        type_args = typing.get_args(type)
+
+        if value is None or type_origin is None and isinstance(value, type):
+            return value
+
+        if dataclasses.is_dataclass(type):
+            return type(**value)
+        if type is uuid.UUID:
+            return type(value)
+
+        if type_origin is dict:
+            return {cls._type_coerce(k, type_args[0]): cls._type_coerce(v, type_args[1]) for k, v in value.items()}
+        if type_origin in (list, tuple, set):
+            return type(cls._type_coerce(v, type_args[0]) for v in value)
+
+        return value
+
+    def to_bytes(self) -> bytes:
         """Returns the instance as json bytes, but also adds a new key 'type'."""
         as_dict = dataclasses.asdict(self, dict_factory=dict_factory)
         as_dict["type"] = self.__class__.__name__
-        as_str = json.dumps(as_dict, cls=JsonEncoder)
+        as_str = json.dumps(as_dict)
         as_bytes = as_str.encode()
         return as_bytes
 
@@ -284,7 +271,7 @@ class Events:
 
         def json(self):
             as_str = self.data[1:].decode()
-            as_dict = json.loads(as_str, cls=JsonDecoder)
+            as_dict = json.loads(as_str)
             return as_dict
 
     @dataclass
@@ -614,9 +601,9 @@ class InputUIWidget(BaseUIWidget):
         n_scrollable_lines: the number of scrollable lines (internal pad height)
         input_submitted_cb: callback function for when input is submitted
         """
+        self.placeholder: InputUIWidgetPlaceholder | None = None
         super().__init__(window, n_scrollable_lines)
         self.input_submitted_cb = input_submitted_cb
-        self.placeholder: InputUIWidgetPlaceholder | None = None
 
     def add_placeholder(self, text: str | Callable, color_pair):
         """Add placeholder text to this input widget."""
@@ -649,9 +636,8 @@ class InputUIWidget(BaseUIWidget):
     def refresh(self) -> None:
         super().refresh()
         # Show the placeholder text if the input is empty and the cursor is at the origin
-        if getattr(self, "placeholder", None):
-            if self.get_text() == "" and self.pad.getyx() == (0, 0):
-                self.placeholder.show()
+        if self.placeholder and self.get_text() == "" and self.pad.getyx() == (0, 0):
+            self.placeholder.show()
 
     async def handle_ch(self, ch: int) -> bool:
         """Handles a keypress of `ch` and returns whether the key was handled."""
@@ -1040,6 +1026,11 @@ if __name__ == "__main__":
     config = RunConfig(**vars(parsed_args))  # Global runtime configuration
 
     # Launch the app
-    with contextlib.suppress(KeyboardInterrupt):
+    try:
         app = App()
         asyncio.run(app.run_forever())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        debug()
+        print(e)
