@@ -11,6 +11,10 @@ profile = "black"
 [tool.black]
 line-length = 120
 
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+
 [tool.poetry.dependencies]
 python = "^3.10"
 

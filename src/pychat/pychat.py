@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import atexit
 import contextlib
 import curses
 import curses.ascii
@@ -12,6 +11,7 @@ import enum
 import itertools
 import json
 import ssl
+import threading
 import typing
 import uuid
 from collections import defaultdict, deque
@@ -35,17 +35,6 @@ class RunConfig:
     ssl: bool
     certfile: str
     cafile: str
-
-
-def debug(clear_curses=True):
-    """Helps with debugging while curses app is running."""
-    import pdb
-
-    if clear_curses:
-        curses.echo()
-        curses.nocbreak()
-        curses.endwin()
-    pdb.set_trace()
 
 
 def dict_factory(*args, **kwargs):
@@ -234,7 +223,7 @@ class Events:
         """Call all the handlers for the given event."""
         for handler in self.get_event_handlers(event):
             if asyncio.iscoroutinefunction(handler):
-                asyncio.Task(handler(event))
+                asyncio.create_task(handler(event))
             else:
                 handler(event)
 
@@ -506,7 +495,7 @@ class BaseUIWidget:
             self.pad.deleteln()
         self.pad.move(y - n, 0)
 
-    async def handle_ch(self, ch: int) -> bool:
+    def handle_ch(self, ch: int) -> bool:
         """
         Make the widget "respond" to the `ch` character event and return a bool whether the ch was handled.
 
@@ -610,14 +599,10 @@ class InputUIWidget(BaseUIWidget):
         ph_win = curses.newwin(self.pad_height, self.pad_width, self.pad_beg_y, self.pad_beg_x)
         self.placeholder = InputUIWidgetPlaceholder(window=ph_win, color_pair=color_pair, text=text)
 
-    async def handle_ch__return(self):
+    def handle_ch__return(self):
         """Handles the return/enter keypress."""
         text = self.get_text().strip()
-        if asyncio.iscoroutinefunction(self.input_submitted_cb):
-            await self.input_submitted_cb(text)
-        else:
-            self.input_submitted_cb(text)
-
+        self.input_submitted_cb(text)
         self.pad.erase()
         self.pad.move(0, 0)
 
@@ -639,7 +624,7 @@ class InputUIWidget(BaseUIWidget):
         if self.placeholder and self.get_text() == "" and self.pad.getyx() == (0, 0):
             self.placeholder.show()
 
-    async def handle_ch(self, ch: int) -> bool:
+    def handle_ch(self, ch: int) -> bool:
         """Handles a keypress of `ch` and returns whether the key was handled."""
         y, x = self.pad.getyx()
         if curses.ascii.isprint(ch):
@@ -669,7 +654,7 @@ class InputUIWidget(BaseUIWidget):
         elif ch == curses.KEY_DC:  # delete
             self.pad.delch()
         elif ch == curses.ascii.NL:  # return / enter
-            await self.handle_ch__return()
+            self.handle_ch__return()
         else:
             return False
 
@@ -789,24 +774,13 @@ class AppUI:
     @staticmethod
     def init_curses():
         """Initialize curses and get the standard screen and have cleanup happen automatically."""
-
-        # Register the cleanup to run when the program exits
-        @atexit.register
-        def cleanup():
-            """Makes the terminal go back to normal."""
-            stdscr.keypad(False)
-            curses.echo()
-            curses.nocbreak()
-            curses.endwin()
-
         stdscr = curses.initscr()
-        stdscr.nodelay(True)  # Make stdscr.getch() "non-blocking"
         curses.noecho()
         curses.cbreak()
         stdscr.keypad(True)
         with contextlib.suppress(Exception):
             curses.start_color()
-        curses.use_default_colors()
+            curses.use_default_colors()
         return stdscr
 
     @property
@@ -825,25 +799,20 @@ class AppUI:
         self.focus_rotation[-1].set_focus(False)
         self.focus_rotation[0].set_focus(True)
 
-    async def run_forever(self):
+    def run_forever(self):
         """Starts & runs the UI indefinitely."""
 
         while True:
-            # Give up control for a bit (STRONG correlation between this value and CPU usage)
-            await asyncio.sleep(0.01)
-
             # Check for key-presses and handle them accordingly
             ch = self.stdscr.getch()
-            if ch == curses.ERR:  # no key-press
-                continue
-            elif chr(ch) == "\t":  # `tab` key-press should rotate which widget has focus
+            if chr(ch) == "\t":  # `tab` key-press should rotate which widget has focus
                 self.rotate_focus()
             else:
-                await self.focused_widget.handle_ch(ch)  # pass the key-press to whichever widget has focus
+                self.focused_widget.handle_ch(ch)
 
-    async def handle_input_submitted(self, text: str):
+    def handle_input_submitted(self, text: str):
         """Callback for when the user submits some text."""
-        await events.push(Events.UserInputSubmitted(text=text))
+        asyncio.run_coroutine_threadsafe(events.push(Events.UserInputSubmitted(text=text)), loop=loop)
 
     def append_user_message(self, text: str, user: User):
         text = f"{user.username:>10}:  {text}"
@@ -888,10 +857,16 @@ class App:
         await app.system_message(f"{user.username} left the chat", send_to_channel=True)
 
     async def run_forever(self):
-        """Starts the app and runs it indefinitely."""
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self.ui.run_forever())
-            tg.create_task(self.network.run_forever())
+        """
+        Starts the app and runs it indefinitely.
+
+        Creates a separate thread to run the UI loop.
+        1) this is standard practice across almost any platform
+        2) it's also the best thing for curses because of the getch() blocking call. While we could make that call
+        non-blocking, the resulting loop uses a lot CPU and sleeping feels sloppy.
+        """
+        threading.Thread(target=self.ui.run_forever, daemon=True).start()
+        await self.network.run_forever()
 
     async def send_dataclass(self, dc, exclude: set[uuid.UUID] | None = None, include: set[uuid.UUID] | None = None):
         """
@@ -998,6 +973,15 @@ async def on_received_data__client(event: Events.ReceivedData):
             await app.system_message(obj)
 
 
+def clear_curses():
+    """Clears the curses terminal changes."""
+    with contextlib.suppress(Exception):
+        app.ui.stdscr.keypad(False)
+    curses.echo()
+    curses.nocbreak()
+    curses.endwin()
+
+
 if __name__ == "__main__":
     # Get command-line run options
     parser = argparse.ArgumentParser(
@@ -1027,10 +1011,14 @@ if __name__ == "__main__":
 
     # Launch the app
     try:
-        app = App()
-        asyncio.run(app.run_forever())
+        with asyncio.Runner() as runner:
+            loop = runner.get_loop()
+            app = App()
+            runner.run(app.run_forever())
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        debug()
-        print(e)
+    except Exception:
+        clear_curses()
+        raise
+    finally:
+        clear_curses()

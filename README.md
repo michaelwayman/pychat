@@ -51,7 +51,7 @@ To build PyChat it requires understanding or building each of the following
 - Concurrency
    - Blocking & nonblocking
    - Queues
-   - Coroutines & threads (threads is coming-soon going to put the UI loop into a thread of its own)
+   - Coroutines & threads
  - Network socket IO
    - Managing multiple connections
    - A client/server communication spec
